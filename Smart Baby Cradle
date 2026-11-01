@@ -1,0 +1,457 @@
+/*******************************************************************************
+ *  SMART BABY CRADLE - IoT MONITORING SYSTEM
+ *  Board : NodeMCU ESP8266 (ESP-12E / ESP-12F)
+ *          Arduino IDE -> Tools -> Board -> "NodeMCU 1.0 (ESP-12E Module)"
+ *  Cloud : Blynk IoT (blynk.cloud)
+ *
+ *  Libraries (Arduino IDE -> Library Manager):
+ *    1. Blynk                    by Volodymyr Shymanskyy  (v1.3.x)
+ *    2. DHT sensor library       by Adafruit
+ *    3. Adafruit Unified Sensor  by Adafruit
+ *
+ *  ---------------------------- WIRING ----------------------------------
+ *  Sound sensor   : G -> GND,  VCC -> 3V3,  DO   -> D5
+ *  DHT11          : G -> GND,  VCC -> 3V3,  DATA -> D2
+ *  Moisture sensor: G -> GND,  VCC -> 3V3,  DO   -> D7   (diaper)
+ *  Relay 1 (Swing motor / Fan-1, sound) : IN -> D1, VCC -> VIN(5V), GND -> GND
+ *  Relay 2 (Cooling fan / Fan-2, temp)  : IN -> D6, VCC -> VIN(5V), GND -> GND
+ *  Motor/fan: Battery(+) -> COM, NO -> motor(+), motor(-) -> Battery(-)
+ *
+ *  ------------------------ BLYNK DATASTREAMS ----------------------------
+ *  V0  Temperature   (double)   V8  Fan_Button     (int, app -> device)
+ *  V1  Humidity      (double)   V9  Mode           (int, 1=Auto 0=Manual)
+ *  V2  Cry_Status    (int)      V10 System_Status  (string)
+ *  V3  Diaper_Status (int)      V11 Humidity_Limit (double, app -> device)
+ *  V4  Swing_Status  (int)      V12 Diaper_Text    (string)
+ *  V5  Fan_Status    (int)      V13 Cry_Text       (string)
+ *  V6  Temp_Alert    (int)      V14 Humidity_Alert (int)
+ *  V7  Swing_Button  (int, app -> device)
+ ******************************************************************************/
+
+// ====== BLYNK CONFIG (must be above the #includes) ======
+#define BLYNK_TEMPLATE_ID   "TMPL3A0b51pXU"
+#define BLYNK_TEMPLATE_NAME "Smart Baby Cradle IoT Monitoring System"
+#define BLYNK_AUTH_TOKEN    "n7XOXWL3Lx6QFzPXXsgBYhLYBlSanyss"
+#define BLYNK_PRINT Serial
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <DHT.h>
+
+// ====== WIFI ======
+char ssid[] = "Harshu";
+char pass[] = "Harsh@121";
+
+// ====== PINS ======
+#define PIN_SOUND     D5
+#define PIN_DHT       D2
+#define PIN_MOISTURE  D7
+#define PIN_SWING     D1     // Relay 1 -> cradle swing motor (sound triggered)
+#define PIN_FAN       D6     // Relay 2 -> cooling fan (temperature triggered)
+#define DHTTYPE       DHT11
+
+// ====== HARDWARE LOGIC LEVELS (change here if your module behaves opposite) ======
+// Most 3-pin LM393 sound modules pull DO LOW when sound is detected (LED turns ON).
+// If "Crying" never triggers or is always ON, change LOW <-> HIGH.
+#define SOUND_ACTIVE_LEVEL  LOW
+// Moisture module DO goes LOW when wet (LED turns ON).
+#define WET_LEVEL         LOW
+// Most blue 1-channel relay modules are ACTIVE LOW.
+#define RELAY_ON            HIGH
+#define RELAY_OFF           LOW
+
+// ====== TUNING ======
+const float         TEMP_HIGH        = 28.0;   // °C : fan turns ON at/above this (auto mode)
+const float         TEMP_HYST        = 1.0;    // °C : fan turns OFF below TEMP_HIGH - TEMP_HYST
+const unsigned long SWING_RUN_MS     = 20000;  // swing keeps running 20 s after last cry sound
+const unsigned long CRY_WINDOW_MS    = 3000;   // window for counting sound pulses
+const int           CRY_MIN_PULSES   = 3;      // pulses inside window to confirm crying
+const unsigned long CRY_CLEAR_MS     = 5000;   // no sound for 5 s -> "Not Crying"
+const int           DIAPER_CONFIRM   = 4;      // 4 identical reads (x500 ms) to change state
+const unsigned long TH_HEARTBEAT_MS  = 300000; // resend temp/hum every 5 min even if unchanged
+const unsigned long EVENT_GAP_MS     = 60000;  // min gap between push notifications
+
+// ====== OBJECTS ======
+DHT dht(PIN_DHT, DHTTYPE);
+BlynkTimer timer;
+
+// ====== STATE ======
+bool  autoMode     = true;
+bool  manualSwing  = false;
+bool  manualFan    = false;
+bool  swingOn      = false;
+bool  fanOn        = false;
+bool  fanAutoState = false;
+
+float temperature  = NAN;
+float humidity     = NAN;
+bool  dhtOk        = false;
+float humLimit     = 70.0;
+bool  tempAlert    = false;
+bool  humAlert     = false;
+
+bool  crying       = false;
+bool  everCried    = false;
+unsigned long lastCryMs     = 0;
+unsigned long cryWindowStart = 0;
+int   cryWindowCount = 0;
+
+bool  diaperWet    = false;
+int   wetCount     = 0;
+int   dryCount     = 0;
+
+unsigned long lastConnTry  = 0;
+unsigned long lastTHSend   = 0;
+float lastSentT = -100, lastSentH = -100;
+unsigned long lastCryEvent = 0, lastWetEvent = 0, lastTempEvent = 0;
+
+// Sound pulses captured by interrupt
+volatile uint16_t soundPulses = 0;
+volatile unsigned long lastPulseIsr = 0;
+
+// Cache so we only send changed values (saves Blynk message quota)
+int    sentInt[15];
+String sentStatus = "", sentDiaperTxt = "", sentCryTxt = "";
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+void resetCache() {
+  for (int i = 0; i < 15; i++) sentInt[i] = -1;
+  sentStatus = ""; sentDiaperTxt = ""; sentCryTxt = "";
+  lastSentT = -100; lastSentH = -100;
+}
+
+void sendInt(uint8_t vpin, int val) {
+  if (!Blynk.connected()) return;
+  if (sentInt[vpin] != val) {
+    Blynk.virtualWrite(vpin, val);
+    sentInt[vpin] = val;
+  }
+}
+
+void sendStr(uint8_t vpin, const String &val, String &cache) {
+  if (!Blynk.connected()) return;
+  if (cache != val) {
+    Blynk.virtualWrite(vpin, val);
+    cache = val;
+  }
+}
+
+void setRelay(uint8_t pin, bool on) {
+  digitalWrite(pin, on ? RELAY_ON : RELAY_OFF);
+}
+
+void notify(const char *code, const char *msg, unsigned long &lastSent) {
+  // Create matching events in Blynk: Template -> Events (codes: baby_crying, diaper_wet, high_temp)
+  if (!Blynk.connected()) return;
+  if (millis() - lastSent >= EVENT_GAP_MS || lastSent == 0) {
+    Blynk.logEvent(code, msg);
+    lastSent = millis();
+  }
+}
+
+// ============================================================================
+//  SOUND (interrupt + processing)
+// ============================================================================
+void IRAM_ATTR soundISR() {
+  unsigned long n = millis();
+  if (n - lastPulseIsr > 40) {       // 40 ms debounce
+    soundPulses++;
+    lastPulseIsr = n;
+  }
+}
+
+void processSound() {
+  noInterrupts();
+  uint16_t p = soundPulses;
+  soundPulses = 0;
+  interrupts();
+
+  unsigned long now = millis();
+  bool levelActive = (digitalRead(PIN_SOUND) == SOUND_ACTIVE_LEVEL);
+
+  if (p > 0) {
+    if (now - cryWindowStart > CRY_WINDOW_MS) {
+      cryWindowStart = now;
+      cryWindowCount = 0;
+    }
+    cryWindowCount += p;
+
+    if (crying) {
+      lastCryMs = now;                          // any sound keeps crying alive
+    } else if (cryWindowCount >= CRY_MIN_PULSES) {
+      crying    = true;
+      everCried = true;
+      lastCryMs = now;
+      Serial.println(F("[CRY] Baby crying detected"));
+      notify("baby_crying", "Baby is crying! Cradle swing started.", lastCryEvent);
+    }
+  }
+
+  if (crying && levelActive) lastCryMs = now;   // continuous loud sound
+
+  if (crying && (now - lastCryMs > CRY_CLEAR_MS)) {
+    crying = false;
+    Serial.println(F("[CRY] Baby stopped crying"));
+  }
+}
+
+// ============================================================================
+//  DIAPER (moisture sensor, debounced)
+// ============================================================================
+void readDiaper() {
+  bool wetNow = (digitalRead(PIN_MOISTURE) == WET_LEVEL);
+  if (wetNow) { wetCount++; dryCount = 0; }
+  else        { dryCount++; wetCount = 0; }
+
+  if (!diaperWet && wetCount >= DIAPER_CONFIRM) {
+    diaperWet = true;
+    Serial.println(F("[DIAPER] WET"));
+    notify("diaper_wet", "Diaper is wet! Please change.", lastWetEvent);
+  } else if (diaperWet && dryCount >= DIAPER_CONFIRM) {
+    diaperWet = false;
+    Serial.println(F("[DIAPER] DRY"));
+  }
+}
+
+// ============================================================================
+//  DHT11
+// ============================================================================
+void readDHT() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    dhtOk = false;
+    Serial.println(F("[DHT] Read failed - check wiring"));
+    return;
+  }
+  dhtOk = true;
+  temperature = t;
+  humidity    = h;
+
+  bool newTempAlert = (temperature >= TEMP_HIGH);
+  if (newTempAlert && !tempAlert) {
+    String m = "High temperature: " + String(temperature, 1) + " C";
+    notify("high_temp", m.c_str(), lastTempEvent);
+  }
+  tempAlert = newTempAlert;
+  humAlert  = (humidity >= humLimit);
+
+  Serial.printf("[DHT] T=%.1f C  H=%.0f %%\n", temperature, humidity);
+
+  // Send only when changed (or heartbeat) to save Blynk message quota
+  if (Blynk.connected()) {
+    unsigned long now = millis();
+    if (fabs(temperature - lastSentT) >= 0.5 || fabs(humidity - lastSentH) >= 1.0 ||
+        now - lastTHSend >= TH_HEARTBEAT_MS) {
+      Blynk.virtualWrite(V0, temperature);
+      Blynk.virtualWrite(V1, humidity);
+      lastSentT = temperature;
+      lastSentH = humidity;
+      lastTHSend = now;
+    }
+  }
+}
+
+// ============================================================================
+//  CONTROL LOGIC
+// ============================================================================
+void controlLogic() {
+  unsigned long now = millis();
+  bool wantSwing, wantFan;
+
+  if (autoMode) {
+    // Swing: while crying + SWING_RUN_MS after last cry sound
+    wantSwing = everCried && (now - lastCryMs < SWING_RUN_MS);
+
+    // Fan: temperature with hysteresis
+    if (dhtOk) {
+      if (temperature >= TEMP_HIGH)                  fanAutoState = true;
+      else if (temperature <= TEMP_HIGH - TEMP_HYST) fanAutoState = false;
+    }
+    wantFan = fanAutoState;
+  } else {
+    wantSwing = manualSwing;
+    wantFan   = manualFan;
+  }
+
+  if (wantSwing != swingOn) {
+    swingOn = wantSwing;
+    setRelay(PIN_SWING, swingOn);
+    Serial.printf("[RELAY] Swing %s\n", swingOn ? "ON" : "OFF");
+  }
+  if (wantFan != fanOn) {
+    fanOn = wantFan;
+    setRelay(PIN_FAN, fanOn);
+    Serial.printf("[RELAY] Fan %s\n", fanOn ? "ON" : "OFF");
+  }
+}
+
+// ============================================================================
+//  UPDATE DASHBOARD
+// ============================================================================
+String buildStatus() {
+  String s = autoMode ? "AUTO: " : "MANUAL: ";
+  String issues = "";
+  if (!dhtOk)    issues += "DHT11 Error | ";
+  if (crying)    issues += "Baby Crying | ";
+  if (diaperWet) issues += "Diaper Wet | ";
+  if (tempAlert) issues += "High Temp | ";
+  if (humAlert)  issues += "High Humidity | ";
+  if (issues.length() == 0) return s + "All Normal";
+  issues.remove(issues.length() - 3);   // remove last " | "
+  return s + issues;
+}
+
+void updateDashboard() {
+  if (!Blynk.connected()) return;
+  sendInt(2,  crying    ? 1 : 0);
+  sendInt(3,  diaperWet ? 1 : 0);
+  sendInt(4,  swingOn   ? 1 : 0);
+  sendInt(5,  fanOn     ? 1 : 0);
+  sendInt(6,  tempAlert ? 1 : 0);
+  sendInt(14, humAlert  ? 1 : 0);
+
+  // In auto mode keep app switches showing real relay state
+  if (autoMode) {
+    sendInt(7, swingOn ? 1 : 0);
+    sendInt(8, fanOn   ? 1 : 0);
+  }
+
+  sendStr(V12, diaperWet ? "WET - Change Diaper" : "DRY", sentDiaperTxt);
+  sendStr(V13, crying ? "Baby Crying" : "Not Crying", sentCryTxt);
+  sendStr(V10, buildStatus(), sentStatus);
+}
+
+// ============================================================================
+//  BLYNK HANDLERS
+// ============================================================================
+BLYNK_CONNECTED() {
+  Serial.println(F("[BLYNK] Connected"));
+  resetCache();
+  Blynk.syncVirtual(V9, V11, V7, V8);   // restore mode, limit, buttons
+  lastTHSend = 0;
+  readDHT();
+  updateDashboard();
+}
+
+BLYNK_WRITE(V9) {          // Operating Mode: 1 = Auto, 0 = Manual
+  bool newAuto = (param.asInt() == 1);
+  if (newAuto == autoMode) return;
+  autoMode = newAuto;
+  if (!autoMode) {
+    // Entering manual: keep whatever is currently running
+    manualSwing = swingOn;
+    manualFan   = fanOn;
+    Blynk.virtualWrite(V7, manualSwing ? 1 : 0);
+    Blynk.virtualWrite(V8, manualFan   ? 1 : 0);
+    sentInt[7] = manualSwing; sentInt[8] = manualFan;
+  }
+  Serial.printf("[MODE] %s\n", autoMode ? "AUTO" : "MANUAL");
+  controlLogic();
+  updateDashboard();
+}
+
+BLYNK_WRITE(V7) {          // Swing Control button
+  manualSwing = (param.asInt() == 1);
+  sentInt[7] = manualSwing;
+  if (autoMode) {          // ignore in auto, show real state
+    Blynk.virtualWrite(V7, swingOn ? 1 : 0);
+    sentInt[7] = swingOn;
+    return;
+  }
+  controlLogic();
+  updateDashboard();
+}
+
+BLYNK_WRITE(V8) {          // Fan Control button
+  manualFan = (param.asInt() == 1);
+  sentInt[8] = manualFan;
+  if (autoMode) {
+    Blynk.virtualWrite(V8, fanOn ? 1 : 0);
+    sentInt[8] = fanOn;
+    return;
+  }
+  controlLogic();
+  updateDashboard();
+}
+
+BLYNK_WRITE(V11) {         // Humidity Threshold slider (20 - 95)
+  humLimit = constrain(param.asFloat(), 20.0, 95.0);
+  if (dhtOk) humAlert = (humidity >= humLimit);
+  Serial.printf("[HUM] Limit = %.0f %%\n", humLimit);
+  updateDashboard();
+}
+
+// ============================================================================
+//  CONNECTION (cradle keeps working even when WiFi/Blynk is down)
+// ============================================================================
+void handleConnection() {
+  if (WiFi.status() != WL_CONNECTED) return;   // ESP8266 auto-reconnects WiFi
+  if (Blynk.connected()) {
+    Blynk.run();
+  } else if (millis() - lastConnTry > 10000 || lastConnTry == 0) {
+    lastConnTry = millis();
+    Serial.println(F("[BLYNK] Connecting..."));
+    Blynk.connect(3000);
+  }
+}
+
+// ============================================================================
+//  SETUP / LOOP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println(F("\n=== Smart Baby Cradle Starting ==="));
+
+  // Relays OFF before enabling outputs (prevents click at boot)
+  digitalWrite(PIN_SWING, RELAY_OFF);
+  digitalWrite(PIN_FAN,   RELAY_OFF);
+  pinMode(PIN_SWING, OUTPUT);
+  pinMode(PIN_FAN,   OUTPUT);
+  setRelay(PIN_SWING, false);
+  setRelay(PIN_FAN,   false);
+
+  pinMode(PIN_SOUND,    INPUT);
+  pinMode(PIN_MOISTURE, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_SOUND), soundISR,
+                  SOUND_ACTIVE_LEVEL == LOW ? FALLING : RISING);
+
+  dht.begin();
+  resetCache();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  Serial.print(F("[WIFI] Connecting"));
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F("[WIFI] IP: "));
+    Serial.println(WiFi.localIP());
+    Blynk.connect(5000);
+  } else {
+    Serial.println(F("[WIFI] Not connected - running offline, will retry"));
+  }
+
+  timer.setInterval(100L,  processSound);
+  timer.setInterval(500L,  readDiaper);
+  timer.setInterval(2500L, readDHT);
+  timer.setInterval(200L,  controlLogic);
+  timer.setInterval(1000L, updateDashboard);
+
+  Serial.println(F("=== System Ready (AUTO mode) ==="));
+}
+
+void loop() {
+  handleConnection();
+  timer.run();
+}
